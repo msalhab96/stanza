@@ -145,6 +145,8 @@ class Trainer:
             params['model']['constituent_stack.lstm.bias_hh_l1']   = params['model']['constituent_lstm.bias_hh_l1']
 
         model_type = checkpoint['model_type']
+        # TODO: when all models have this baked in, no need to 'get' this parameter
+        common_tags = params.get('common_tags', set())
         if model_type == 'LSTM':
             pt = load_pretrain(saved_args.get('wordvec_pretrain_file', None), foundation_cache)
             bert_model, bert_tokenizer = load_bert(saved_args.get('bert_model', None), foundation_cache)
@@ -159,6 +161,7 @@ class Trainer:
                               transitions=Trainer.fix_shift_transitions(params['transitions']),
                               constituents=params['constituents'],
                               tags=params['tags'],
+                              common_tags=common_tags,
                               words=params['words'],
                               rare_words=params['rare_words'],
                               root_labels=params['root_labels'],
@@ -346,16 +349,20 @@ def build_trainer(args, train_trees, dev_trees, foundation_cache, model_load_fil
         if tag not in tags:
             logger.info("Found tag in dev set which does not exist in train set: %s  Continuing...", tag)
 
+    num_common_tags = args['num_tag_shifts']
+    if num_common_tags < 0:
+        num_common_tags = len(tags)
+    common_tags = parse_tree.Tree.get_common_tags(train_trees, num_common_tags)
     unary_limit = max(max(t.count_unary_depth() for t in train_trees),
                       max(t.count_unary_depth() for t in dev_trees)) + 1
-    train_sequences = convert_trees_to_sequences(train_trees, "training", args['transition_scheme'], tags)
+    train_sequences = convert_trees_to_sequences(train_trees, "training", args['transition_scheme'], common_tags)
     # the training transitions will all be labeled with the tags
     # currently we are just checking correctness
     # we add an unlabeled Shift so that the model can represent previously unseen tags
     # at train time we will redo some tags as <UNK> to train the unlabeled Shift
     # (this also will essentially be a form of dropout)
     train_transitions = transition_sequence.all_transitions(train_sequences + [[parse_transitions.Shift()]])
-    dev_sequences = convert_trees_to_sequences(dev_trees, "dev", args['transition_scheme'], tags)
+    dev_sequences = convert_trees_to_sequences(dev_trees, "dev", args['transition_scheme'], common_tags)
     dev_transitions = transition_sequence.all_transitions(dev_sequences)
 
     logger.info("Total unique transitions in train set: %d", len(train_transitions))
@@ -422,7 +429,7 @@ def build_trainer(args, train_trees, dev_trees, foundation_cache, model_load_fil
         # using the model's current values works for if the new
         # dataset is the same or smaller
         # TODO: handle a larger dataset as well
-        model = LSTMModel(pt, forward_charlm, backward_charlm, bert_model, bert_tokenizer, trainer.model.transitions, trainer.model.constituents, trainer.model.tags, trainer.model.delta_words, trainer.model.rare_words, trainer.model.root_labels, trainer.model.constituent_opens, trainer.model.unary_limit(), args)
+        model = LSTMModel(pt, forward_charlm, backward_charlm, bert_model, bert_tokenizer, trainer.model.transitions, trainer.model.constituents, trainer.model.tags, trainer.model.common_tags, trainer.model.delta_words, trainer.model.rare_words, trainer.model.root_labels, trainer.model.constituent_opens, trainer.model.unary_limit(), args)
         if args['cuda']:
             model.cuda()
         model.copy_with_new_structure(trainer.model)
@@ -439,14 +446,14 @@ def build_trainer(args, train_trees, dev_trees, foundation_cache, model_load_fil
         temp_args['pattn_num_layers'] = 0
         temp_args['lattn_d_proj'] = 0
 
-        temp_model = LSTMModel(pt, forward_charlm, backward_charlm, bert_model, bert_tokenizer, train_transitions, train_constituents, tags, words, rare_words, root_labels, open_nodes, unary_limit, temp_args)
+        temp_model = LSTMModel(pt, forward_charlm, backward_charlm, bert_model, bert_tokenizer, train_transitions, train_constituents, tags, common_tags, words, rare_words, root_labels, open_nodes, unary_limit, temp_args)
         if args['cuda']:
             temp_model.cuda()
         temp_optim = build_optimizer(temp_args, temp_model, True)
         scheduler = build_scheduler(temp_args, temp_optim)
         trainer = Trainer(temp_args, temp_model, temp_optim, scheduler)
     else:
-        model = LSTMModel(pt, forward_charlm, backward_charlm, bert_model, bert_tokenizer, train_transitions, train_constituents, tags, words, rare_words, root_labels, open_nodes, unary_limit, args)
+        model = LSTMModel(pt, forward_charlm, backward_charlm, bert_model, bert_tokenizer, train_transitions, train_constituents, tags, common_tags, words, rare_words, root_labels, open_nodes, unary_limit, args)
         if args['cuda']:
             model.cuda()
         logger.info("Number of words in the training set found in the embedding: {} out of {}".format(model.num_words_known(words), len(words)))
@@ -665,7 +672,7 @@ def iterate_training(args, trainer, train_trees, train_sequences, transitions, d
             forward_charlm = foundation_cache.load_charlm(args['charlm_forward_file'])
             backward_charlm = foundation_cache.load_charlm(args['charlm_backward_file'])
             bert_model, bert_tokenizer = foundation_cache.load_bert(args['bert_model'])
-            new_model = LSTMModel(pt, forward_charlm, backward_charlm, bert_model, bert_tokenizer, model.transitions, model.constituents, model.tags, model.delta_words, model.rare_words, model.root_labels, model.constituent_opens, model.unary_limit(), temp_args)
+            new_model = LSTMModel(pt, forward_charlm, backward_charlm, bert_model, bert_tokenizer, model.transitions, model.constituents, model.tags, model.common_tags, model.delta_words, model.rare_words, model.root_labels, model.constituent_opens, model.unary_limit(), temp_args)
             if args['cuda']:
                 new_model.cuda()
             new_model.copy_with_new_structure(model)
@@ -735,7 +742,7 @@ def train_model_one_batch(epoch, batch_idx, model, batch, transition_tensors, mo
     # the state is build as a bulk operation
     gold_trees = [x.tree.dropout_tags(args['tag_dropout']) for x in batch]
     preterminals = [list(x.yield_preterminals()) for x in gold_trees]
-    train_sequences = transition_sequence.build_treebank(gold_trees, args['transition_scheme'], model.tags)
+    train_sequences = transition_sequence.build_treebank(gold_trees, args['transition_scheme'], model.common_tags)
     initial_states = parse_transitions.initial_state_from_preterminals(preterminals, model, gold_trees)
     batch = [state._replace(gold_sequence=sequence)
              for sequence, state in zip(train_sequences, initial_states)]

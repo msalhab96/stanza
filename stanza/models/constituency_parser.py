@@ -366,6 +366,8 @@ def parse_args(args=None):
     #     0.4:        0.951272
     parser.add_argument('--tag_dropout', default=0.1, type=float,
                         help='Fraction of tags to replace with <UNK> at training time')
+    parser.add_argument('--num_tag_shifts', default=5, type=int,
+                        help='How many tags to use when labeling shifts.  -1 means all of them')
 
     # combining dummy and open node embeddings might be a slight improvement
     # for example, after 550 iterations, one experiment had
