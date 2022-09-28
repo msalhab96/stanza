@@ -30,7 +30,7 @@ from stanza.models.constituency import transition_sequence
 from stanza.models.constituency import tree_reader
 from stanza.models.constituency.base_model import SimpleModel, UNARY_LIMIT
 from stanza.models.constituency.dynamic_oracle import RepairType, oracle_inorder_error
-from stanza.models.constituency.lstm_model import LSTMModel, StackHistory
+from stanza.models.constituency.lstm_model import LSTMModel, StackHistory, BertMix
 from stanza.models.constituency.parse_transitions import State, TransitionScheme
 from stanza.models.constituency.parse_tree import Tree
 from stanza.models.constituency.utils import retag_trees, build_optimizer, build_scheduler
@@ -107,6 +107,7 @@ class Trainer:
         if 'bert_hidden_layers' not in checkpoint['args']:
             # TODO: no need to do this once the models have bert_hidden_layers in them
             saved_args['bert_hidden_layers'] = None
+            saved_args['bert_mix'] = BertMix.NONE
 
         params = checkpoint['params']
 
