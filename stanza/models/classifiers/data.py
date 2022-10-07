@@ -33,6 +33,8 @@ class SentimentDatum:
         else:
             return {'sentiment': self.sentiment, 'text': self.text, 'constituency': str(self.constituency)}
 
+RankingDatum = namedtuple("RankingDatum", ["value", "text", "good", "bad"])
+
 def update_text(sentence: List[str], wordvec_type: WVType) -> List[str]:
     """
     Process a line of text (with tokenization provided as whitespace)
