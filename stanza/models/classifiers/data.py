@@ -71,7 +71,7 @@ def update_text(sentence: List[str], wordvec_type: WVType) -> List[str]:
         raise ValueError("Unknown wordvec_type {}".format(wordvec_type))
 
 
-def read_dataset(dataset, wordvec_type: WVType, min_len: int) -> List[SentimentDatum]:
+def read_dataset(dataset, wordvec_type: WVType, min_len: int, ranking: bool = False) -> List:
     """
     returns a list where the values of the list are
       label, [token...]
@@ -80,12 +80,18 @@ def read_dataset(dataset, wordvec_type: WVType, min_len: int) -> List[SentimentD
     for filename in str(dataset).split(","):
         with open(filename, encoding="utf-8") as fin:
             new_lines = json.load(fin)
-        new_lines = [(str(x['sentiment']), x['text'], x.get('constituency', None)) for x in new_lines]
+        if ranking:
+            new_lines = [(x['value'], x['text'], x['good'], x['bad']) for x in new_lines]
+        else:
+            new_lines = [(str(x['sentiment']), x['text'], x.get('constituency', None)) for x in new_lines]
         lines.extend(new_lines)
     # TODO: maybe do this processing later, once the model is built.
     # then move the processing into the model so we can use
     # overloading to potentially make future model types
-    lines = [SentimentDatum(x[0], update_text(x[1], wordvec_type), tree_reader.read_trees(x[2])[0] if x[2] else None) for x in lines]
+    if ranking:
+        lines = [RankingDatum(float(x[0]), update_text(x[1], wordvec_type), tree_reader.read_trees(x[2])[0], tree_reader.read_trees(x[3])[0]) for x in lines]
+    else:
+        lines = [SentimentDatum(x[0], update_text(x[1], wordvec_type), tree_reader.read_trees(x[2])[0] if x[2] else None) for x in lines]
     if min_len:
         lines = [x for x in lines if len(x.text) >= min_len]
     return lines

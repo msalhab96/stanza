@@ -171,6 +171,7 @@ def build_parser():
     parser.add_argument('--dev_file', type=str, default=DEFAULT_DEV, help='Input file(s) to use as the dev set.')
     parser.add_argument('--test_file', type=str, default=DEFAULT_TEST, help='Input file(s) to use as the test set.')
     parser.add_argument('--max_epochs', type=int, default=100)
+    parser.add_argument('--tick', type=int, default=2000)
 
     parser.add_argument('--model_type', type=lambda x: ModelType[x.upper()], default=ModelType.CNN,
                         help='Model type to use.  Options: %s' % " ".join(x.name for x in ModelType))
@@ -265,6 +266,9 @@ def build_parser():
     parser.add_argument('--constituency_top_layer', dest='constituency_top_layer', default=False, action='store_true', help='True means use the top (ROOT) layer of the constituents.  Otherwise, the next layer down (S, usually) will be used')
     parser.add_argument('--no_constituency_top_layer', dest='constituency_top_layer', action='store_false', help='True means use the top (ROOT) layer of the constituents.  Otherwise, the next layer down (S, usually) will be used')
     parser.add_argument('--no_constituency_use_words', dest='constituency_use_words', default=True, action='store_false', help='Use the start and end word embeddings as inputs to the constituency classifier')
+
+    parser.add_argument('--ranking', action='store_true', default=False, help='Do ranking instead of classification')
+    parser.add_argument('--ranking_margin', type=float, default=0.1, help='Margin for the ranking loss')
 
     parser.add_argument('--log_norms', default=False, action='store_true', help='Log the parameters norms while training.  A very noisy option')
 
@@ -384,7 +388,7 @@ def score_dataset(model, dataset, label_map=None,
                 correct = correct + 1
     return correct
 
-def score_dev_set(model, dev_set, dev_eval_scoring):
+def score_classification_set(model, dev_set, dev_eval_scoring):
     confusion_matrix = confusion_dataset(model, dev_set)
     logger.info("Dev set confusion matrix:\n{}".format(format_confusion(confusion_matrix, model.labels)))
     correct, total = confusion_to_accuracy(confusion_matrix)
@@ -400,6 +404,22 @@ def score_dev_set(model, dev_set, dev_eval_scoring):
         return macro_f1, accuracy, macro_f1
     else:
         raise ValueError("Unknown scoring method {}".format(dev_eval_scoring))
+
+def score_ranking_set(model, dev_set):
+    # TODO: batchify this
+    with torch.no_grad():
+        good_scores = model([x.good for x in dev_set]).squeeze()
+        bad_scores = model([x.bad for x in dev_set]).squeeze()
+        score = torch.sum(good_scores > bad_scores).item()
+    accuracy = score / len(dev_set)
+    logger.info("Dev set: %d correct of %d examples.  Accuracy: %f", score, len(dev_set), accuracy)
+    return accuracy, accuracy, None
+
+def score_dev_set(args, model, dev_set):
+    if args.ranking:
+        return score_ranking_set(model, dev_set)
+    else:
+        return score_classification_set(model, dev_set, args.dev_eval_scoring)
 
 def intermediate_name(filename, epoch, dev_scoring, score):
     """
@@ -427,25 +447,28 @@ def train_model(trainer, model_file, checkpoint_file, args, train_set, dev_set, 
     device = next(model.parameters()).device
     logger.info("Current device: %s" % device)
 
-    label_map = {x: y for (y, x) in enumerate(labels)}
-    label_tensors = {x: torch.tensor(y, requires_grad=False, device=device)
-                     for (y, x) in enumerate(labels)}
-
-    if args.loss == Loss.CROSS:
-        loss_function = nn.CrossEntropyLoss()
-    elif args.loss == Loss.WEIGHTED_CROSS:
-        loss_function = loss.weighted_cross_entropy_loss([label_map[x[0]] for x in train_set], log_dampened=False)
-    elif args.loss == Loss.LOG_CROSS:
-        loss_function = loss.weighted_cross_entropy_loss([label_map[x[0]] for x in train_set], log_dampened=True)
+    if args.ranking:
+        loss_function = nn.MarginRankingLoss(margin=args.ranking_margin)
     else:
-        raise ValueError("Unknown loss function {}".format(args.loss))
+        label_map = {x: y for (y, x) in enumerate(labels)}
+        label_tensors = {x: torch.tensor(y, requires_grad=False, device=device)
+                         for (y, x) in enumerate(labels)}
+
+        if args.loss == Loss.CROSS:
+            loss_function = nn.CrossEntropyLoss()
+        elif args.loss == Loss.WEIGHTED_CROSS:
+            loss_function = loss.weighted_cross_entropy_loss([label_map[x[0]] for x in train_set], log_dampened=False)
+        elif args.loss == Loss.LOG_CROSS:
+            loss_function = loss.weighted_cross_entropy_loss([label_map[x[0]] for x in train_set], log_dampened=True)
+        else:
+            raise ValueError("Unknown loss function {}".format(args.loss))
     loss_function.to(device)
 
     train_set_by_len = data.sort_dataset_by_len(train_set)
 
     if trainer.global_step > 0:
         # We reloaded the model, so let's report its current dev set score
-        _ = score_dev_set(model, dev_set, args.dev_eval_scoring)
+        score_dev_set(args, model, dev_set)
         logger.info("Reloaded model for continued training.")
         if trainer.best_score is not None:
             logger.info("Previous best score: %.5f", trainer.best_score)
@@ -479,20 +502,28 @@ def train_model(trainer, model_file, checkpoint_file, args, train_set, dev_set, 
             logger.debug("Starting batch: %d step %d", start_batch, trainer.global_step)
 
             batch = shuffled[start_batch:start_batch+args.batch_size]
-            batch_labels = torch.stack([label_tensors[x.sentiment] for x in batch])
+            if args.ranking:
+                batch_labels = torch.tensor([x.value for x in batch], device=device)
+            else:
+                batch_labels = torch.stack([label_tensors[x.sentiment] for x in batch])
 
             # zero the parameter gradients
             optimizer.zero_grad()
 
-            outputs = model(batch)
-            batch_loss = loss_function(outputs, batch_labels)
+            if args.ranking:
+                good_outputs = model([x.good for x in batch])
+                bad_outputs = model([x.bad for x in batch])
+                batch_loss = loss_function(good_outputs, bad_outputs, batch_labels)
+            else:
+                outputs = model(batch)
+                batch_loss = loss_function(outputs, batch_labels)
             batch_loss.backward()
             optimizer.step()
 
             # print statistics
             running_loss += batch_loss.item()
-            if ((batch_num + 1) * args.batch_size) % 2000 < args.batch_size: # print every 2000 items
-                train_loss = running_loss / 2000
+            if ((batch_num + 1) * args.batch_size) % args.tick < args.batch_size: # print every 2000 items
+                train_loss = running_loss / args.tick
                 logger.info('[%d, %5d] Average loss: %.3f' %
                             (trainer.epochs_trained + 1, ((batch_num + 1) * args.batch_size), train_loss))
                 if args.wandb:
@@ -500,13 +531,16 @@ def train_model(trainer, model_file, checkpoint_file, args, train_set, dev_set, 
                 if (args.dev_eval_steps > 0 and
                     ((batch_num + 1) * args.batch_size) % args.dev_eval_steps < args.batch_size):
                     logger.info('---- Interim analysis ----')
-                    dev_score, accuracy, macro_f1 = score_dev_set(model, dev_set, args.dev_eval_scoring)
+                    dev_score, accuracy, macro_f1 = score_dev_set(args, model, dev_set)
                     if args.wandb:
                         wandb.log({'accuracy': accuracy, 'macro_f1': macro_f1}, step=trainer.global_step)
                     if trainer.best_score is None or dev_score > trainer.best_score:
                         trainer.best_score = dev_score
                         trainer.save(model_file, save_optimizer=False)
-                        logger.info("Saved new best score model!  Accuracy %.5f   Macro F1 %.5f   Epoch %5d   Batch %d" % (accuracy, macro_f1, trainer.epochs_trained+1, batch_num+1))
+                        if args.ranking:
+                            logger.info("Saved new best score model!  Accuracy %.5f   Epoch %5d", accuracy, trainer.epochs_trained+1)
+                        else:
+                            logger.info("Saved new best score model!  Accuracy %.5f   Macro F1 %.5f   Epoch %5d", accuracy, macro_f1, trainer.epochs_trained+1)
                     model.train()
                 epoch_loss += running_loss
                 running_loss = 0.0
@@ -514,9 +548,11 @@ def train_model(trainer, model_file, checkpoint_file, args, train_set, dev_set, 
         epoch_loss += running_loss
 
         logger.info("Finished epoch %d  Total loss %.3f" % (trainer.epochs_trained + 1, epoch_loss))
-        dev_score, accuracy, macro_f1 = score_dev_set(model, dev_set, args.dev_eval_scoring)
+        dev_score, accuracy, macro_f1 = score_dev_set(args, model, dev_set)
         if args.wandb:
-            wandb.log({'accuracy': accuracy, 'macro_f1': macro_f1, 'epoch_loss': epoch_loss}, step=trainer.global_step)
+            wandb.log({'accuracy': accuracy, 'epoch_loss': epoch_loss}, step=trainer.global_step)
+            if macro_f1 is not None:
+                wandb.log({'macro_f1': macro_f1}, step=trainer.global_step)
         if checkpoint_file:
             trainer.save(checkpoint_file, epochs_trained = trainer.epochs_trained + 1)
         if args.save_intermediate_models:
@@ -525,7 +561,10 @@ def train_model(trainer, model_file, checkpoint_file, args, train_set, dev_set, 
         if trainer.best_score is None or dev_score > trainer.best_score:
             trainer.best_score = dev_score
             trainer.save(model_file, save_optimizer=False)
-            logger.info("Saved new best score model!  Accuracy %.5f   Macro F1 %.5f   Epoch %5d" % (accuracy, macro_f1, trainer.epochs_trained+1))
+            if args.ranking:
+                logger.info("Saved new best score model!  Accuracy %.5f   Epoch %5d" % (accuracy, trainer.epochs_trained+1))
+            else:
+                logger.info("Saved new best score model!  Accuracy %.5f   Macro F1 %.5f   Epoch %5d" % (accuracy, macro_f1, trainer.epochs_trained+1))
 
     if args.wandb:
         wandb.finish()
@@ -550,9 +589,10 @@ def main(args=None):
     # make cuda operations faster
     checkpoint_file = None
     if args.train:
-        train_set = data.read_dataset(args.train_file, args.wordvec_type, args.min_train_len)
+        train_set = data.read_dataset(args.train_file, args.wordvec_type, args.min_train_len, args.ranking)
         logger.info("Using training set: %s" % args.train_file)
-        logger.info("Training set has %d labels" % len(data.dataset_labels(train_set)))
+        if not args.ranking:
+            logger.info("Training set has %d labels" % len(data.dataset_labels(train_set)))
         tlogger.setLevel(logging.DEBUG)
 
         if args.checkpoint:
@@ -579,32 +619,35 @@ def main(args=None):
     if args.train:
         utils.log_training_args(args, logger)
 
-        dev_set = data.read_dataset(args.dev_file, args.wordvec_type, min_len=None)
+        dev_set = data.read_dataset(args.dev_file, args.wordvec_type, min_len=None, ranking=args.ranking)
         logger.info("Using dev set: %s", args.dev_file)
         logger.info("Training set has %d items", len(train_set))
         logger.info("Dev set has %d items", len(dev_set))
-        data.check_labels(trainer.model.labels, dev_set)
+        if not args.ranking:
+            data.check_labels(trainer.model.labels, dev_set)
 
         train_model(trainer, model_file, checkpoint_file, args, train_set, dev_set, trainer.model.labels)
 
     if args.log_norms:
         trainer.model.log_norms()
-    test_set = data.read_dataset(args.test_file, args.wordvec_type, min_len=None)
+    test_set = data.read_dataset(args.test_file, args.wordvec_type, min_len=None, ranking=args.ranking)
     logger.info("Using test set: %s" % args.test_file)
-    data.check_labels(trainer.model.labels, test_set)
-
-    if args.test_remap_labels is None:
-        confusion_matrix = confusion_dataset(trainer.model, test_set)
-        logger.info("Confusion matrix:\n{}".format(format_confusion(confusion_matrix, trainer.model.labels)))
-        correct, total = confusion_to_accuracy(confusion_matrix)
-        logger.info("Macro f1: {}".format(confusion_to_macro_f1(confusion_matrix)))
+    if args.ranking:
+        score_dev_set(args, trainer.model, test_set)
     else:
-        correct = score_dataset(trainer.model, test_set,
-                                remap_labels=args.test_remap_labels,
-                                forgive_unmapped_labels=args.forgive_unmapped_labels)
-        total = len(test_set)
-    logger.info("Test set: %d correct of %d examples.  Accuracy: %f" %
-                (correct, total, correct / total))
+        data.check_labels(trainer.model.labels, test_set)
+        if args.test_remap_labels is None:
+            confusion_matrix = confusion_dataset(trainer.model, test_set)
+            logger.info("Confusion matrix:\n{}".format(format_confusion(confusion_matrix, trainer.model.labels)))
+            correct, total = confusion_to_accuracy(confusion_matrix)
+            logger.info("Macro f1: {}".format(confusion_to_macro_f1(confusion_matrix)))
+        else:
+            correct = score_dataset(trainer.model, test_set,
+                                    remap_labels=args.test_remap_labels,
+                                    forgive_unmapped_labels=args.forgive_unmapped_labels)
+            total = len(test_set)
+        logger.info("Test set: %d correct of %d examples.  Accuracy: %f" %
+                    (correct, total, correct / total))
 
 if __name__ == '__main__':
     main()

@@ -173,7 +173,10 @@ class Trainer:
         if train_set is None:
             raise ValueError("Must have a train set to build a new model - needed for labels and delta word vectors")
 
-        labels = data.dataset_labels(train_set)
+        if args.ranking:
+            labels = ['score']
+        else:
+            labels = data.dataset_labels(train_set)
 
         if args.model_type == ModelType.CNN:
             pretrain = Trainer.load_pretrain(args, foundation_cache=None)
