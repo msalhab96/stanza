@@ -231,7 +231,7 @@ class LSTMModel(BaseModel, nn.Module):
 
         self.hidden_size = self.args['hidden_size']
         self.constituency_composition = self.args.get("constituency_composition", ConstituencyComposition.BILSTM)
-        if self.constituency_composition == ConstituencyComposition.ATTN:
+        if self.constituency_composition == ConstituencyComposition.ATTN or self.constituency_composition == ConstituencyComposition.KEY:
             self.reduce_heads = self.args['reduce_heads']
             if self.hidden_size % self.reduce_heads != 0:
                 self.hidden_size = self.hidden_size + self.reduce_heads - (self.hidden_size % self.reduce_heads)
@@ -503,7 +503,7 @@ class LSTMModel(BaseModel, nn.Module):
         elif self.constituency_composition == ConstituencyComposition.KEY:
             self.reduce_query = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
             self.reduce_value = nn.Linear(self.hidden_size, self.hidden_size)
-            self.register_parameter('reduce_key', torch.nn.Parameter(torch.randn(self.hidden_size, requires_grad=True)))
+            self.register_parameter('reduce_key', torch.nn.Parameter(torch.randn(self.reduce_heads, self.hidden_size // self.reduce_heads, 1, requires_grad=True)))
         elif self.constituency_composition == ConstituencyComposition.TREE_LSTM:
             self.constituent_reduce_lstm = nn.LSTM(input_size=self.hidden_size, hidden_size=self.hidden_size, num_layers=self.num_tree_lstm_layers, dropout=self.lstm_layer_dropout)
         elif self.constituency_composition == ConstituencyComposition.TREE_LSTM_CX:
@@ -882,10 +882,13 @@ class LSTMModel(BaseModel, nn.Module):
             node_hx = [torch.stack([child.value.tree_hx for child in children]) for children in children_lists]
             node_hx = [x.reshape(x.shape[0], -1) for x in node_hx]
             query_hx = [self.reduce_query(nhx) for nhx in node_hx]
+            query_hx = [nhx.reshape(nhx.shape[0], self.reduce_heads, -1).transpose(0, 1) for nhx in query_hx]
             queries = [torch.matmul(nhx, self.reduce_key) for nhx in query_hx]
-            weights = [torch.nn.functional.softmax(nhx, dim=0).unsqueeze(0) for nhx in queries]
+            weights = [torch.nn.functional.softmax(nhx, dim=1).transpose(1, 2) for nhx in queries]
             value_hx = [self.reduce_value(nhx) for nhx in node_hx]
-            unpacked_hx = [torch.matmul(weight, nhx).squeeze(0) for weight, nhx in zip(weights, value_hx)]
+            value_hx = [nhx.reshape(nhx.shape[0], self.reduce_heads, -1).transpose(0, 1) for nhx in value_hx]
+            unpacked_hx = [torch.matmul(weight, nhx).squeeze(1) for weight, nhx in zip(weights, value_hx)]
+            unpacked_hx = [nhx.reshape(-1) for nhx in unpacked_hx]
             hx = torch.stack(unpacked_hx, axis=0)
             lstm_hx = self.nonlinearity(hx).unsqueeze(0)
             lstm_cx = None
