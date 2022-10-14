@@ -881,11 +881,11 @@ class LSTMModel(BaseModel, nn.Module):
         elif self.constituency_composition == ConstituencyComposition.KEY:
             node_hx = [torch.stack([child.value.tree_hx for child in children]) for children in children_lists]
             node_hx = [x.reshape(x.shape[0], -1) for x in node_hx]
-            node_hx = [self.reduce_query(nhx) for nhx in node_hx]
-            queries = [torch.matmul(nhx, self.reduce_key) for nhx in node_hx]
+            query_hx = [self.reduce_query(nhx) for nhx in node_hx]
+            queries = [torch.matmul(nhx, self.reduce_key) for nhx in query_hx]
             weights = [torch.nn.functional.softmax(nhx, dim=0).unsqueeze(0) for nhx in queries]
-            node_hx = [self.reduce_value(nhx) for nhx in node_hx]
-            unpacked_hx = [torch.matmul(weight, nhx).squeeze(0) for weight, nhx in zip(weights, node_hx)]
+            value_hx = [self.reduce_value(nhx) for nhx in node_hx]
+            unpacked_hx = [torch.matmul(weight, nhx).squeeze(0) for weight, nhx in zip(weights, value_hx)]
             hx = torch.stack(unpacked_hx, axis=0)
             lstm_hx = self.nonlinearity(hx).unsqueeze(0)
             lstm_cx = None
