@@ -170,6 +170,11 @@ class StackHistory(Enum):
 #   UNTIED_MAX          0.9592
 # Furthermore, starting from a finished MAX model and restarting
 #   by splitting the MAX layer into multiple pieces did not improve.
+#
+# KEY has a single Key which is used for a facsimile of ATTN
+#   each incoming subtree has its values weighted by a Query
+#   then the Key is used to calculate a softmax
+#   finally, a Value is used to scale the subtrees
 class ConstituencyComposition(Enum):
     BILSTM                = 1
     MAX                   = 2
@@ -179,6 +184,7 @@ class ConstituencyComposition(Enum):
     ATTN                  = 6
     TREE_LSTM_CX          = 7
     UNTIED_MAX            = 8
+    KEY                   = 9
 
 class LSTMModel(BaseModel, nn.Module):
     def __init__(self, pretrain, forward_charlm, backward_charlm, bert_model, bert_tokenizer, transitions, constituents, tags, words, rare_words, root_labels, constituent_opens, unary_limit, args):
@@ -494,6 +500,10 @@ class LSTMModel(BaseModel, nn.Module):
             initialize_linear(self.reduce_bigram, self.args['nonlinearity'], self.hidden_size)
         elif self.constituency_composition == ConstituencyComposition.ATTN:
             self.reduce_attn = nn.MultiheadAttention(self.hidden_size, self.reduce_heads)
+        elif self.constituency_composition == ConstituencyComposition.KEY:
+            self.reduce_query = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+            self.reduce_value = nn.Linear(self.hidden_size, self.hidden_size)
+            self.register_parameter('reduce_key', torch.nn.Parameter(torch.randn(self.hidden_size, requires_grad=True)))
         elif self.constituency_composition == ConstituencyComposition.TREE_LSTM:
             self.constituent_reduce_lstm = nn.LSTM(input_size=self.hidden_size, hidden_size=self.hidden_size, num_layers=self.num_tree_lstm_layers, dropout=self.lstm_layer_dropout)
         elif self.constituency_composition == ConstituencyComposition.TREE_LSTM_CX:
@@ -783,6 +793,8 @@ class LSTMModel(BaseModel, nn.Module):
         children_lists is a list of children that go under each of the new nodes
         lists of each are used so that we can stack operations
         """
+        # at the end of each of these operations, we expect lstm_hx.shape
+        # is (L, N, hidden_size) for N lists of children
         if (self.constituency_composition == ConstituencyComposition.BILSTM or
             self.constituency_composition == ConstituencyComposition.BILSTM_MAX):
             node_hx = [[child.value.tree_hx.squeeze(0) for child in children] for children in children_lists]
@@ -863,6 +875,17 @@ class LSTMModel(BaseModel, nn.Module):
             unpacked_hx = [torch.cat((lhx.unsqueeze(0).unsqueeze(0), nhx), axis=0) for lhx, nhx in zip(label_hx, unpacked_hx)]
             unpacked_hx = [self.reduce_attn(nhx, nhx, nhx)[0].squeeze(1) for nhx in unpacked_hx]
             unpacked_hx = [self.lstm_input_dropout(torch.max(nhx, 0).values) for nhx in unpacked_hx]
+            hx = torch.stack(unpacked_hx, axis=0)
+            lstm_hx = self.nonlinearity(hx).unsqueeze(0)
+            lstm_cx = None
+        elif self.constituency_composition == ConstituencyComposition.KEY:
+            node_hx = [torch.stack([child.value.tree_hx for child in children]) for children in children_lists]
+            node_hx = [x.reshape(x.shape[0], -1) for x in node_hx]
+            node_hx = [self.reduce_query(nhx) for nhx in node_hx]
+            queries = [torch.matmul(nhx, self.reduce_key) for nhx in node_hx]
+            weights = [torch.nn.functional.softmax(nhx, dim=0).unsqueeze(0) for nhx in queries]
+            node_hx = [self.reduce_value(nhx) for nhx in node_hx]
+            unpacked_hx = [torch.matmul(weight, nhx).squeeze(0) for weight, nhx in zip(weights, node_hx)]
             hx = torch.stack(unpacked_hx, axis=0)
             lstm_hx = self.nonlinearity(hx).unsqueeze(0)
             lstm_cx = None
