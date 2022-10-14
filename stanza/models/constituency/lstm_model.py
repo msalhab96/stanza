@@ -175,6 +175,9 @@ class StackHistory(Enum):
 #   each incoming subtree has its values weighted by a Query
 #   then the Key is used to calculate a softmax
 #   finally, a Value is used to scale the subtrees
+#   reduce_heads is used to determine the number of heads
+#   no position information is used - lots of languages allow
+#   some phrase reordering, after all...
 class ConstituencyComposition(Enum):
     BILSTM                = 1
     MAX                   = 2
