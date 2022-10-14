@@ -200,6 +200,9 @@ def test_forward_constituency_composition(pretrain_file):
     model = build_model(pretrain_file, '--constituency_composition', 'key')
     run_forward_checks(model, num_states=2)
 
+    model = build_model(pretrain_file, '--constituency_composition', 'untied_key')
+    run_forward_checks(model, num_states=2)
+
     model = build_model(pretrain_file, '--constituency_composition', 'bilstm')
     run_forward_checks(model, num_states=2)
 
