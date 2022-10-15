@@ -43,7 +43,12 @@ class ConstituencyClassifier(nn.Module):
         else:
             self.input_norm = nn.Identity()
 
-        self.fc_input_size = self.hidden_size
+        self.query = nn.Linear(self.constituency_parser.hidden_size, self.constituency_parser.hidden_size)
+        self.key = nn.Linear(self.hidden_size, self.constituency_parser.hidden_size)
+        self.value = nn.Linear(self.constituency_parser.hidden_size, self.constituency_parser.hidden_size)
+
+        self.fc_input_size = self.constituency_parser.hidden_size
+        #self.fc_input_size = self.hidden_size
         self.fc_layers = build_output_layers(self.fc_input_size, self.config.fc_shapes, self.config.num_classes)
         self.dropout = nn.Dropout(self.config.dropout)
 
@@ -91,9 +96,20 @@ class ConstituencyClassifier(nn.Module):
             constituent_hx = torch.cat([constituents[-2].tree_hx for constituents in constituent_lists], axis=0)
 
         if self.config.constituency_use_words:
-            previous_layer = torch.cat((word_begin_hx, word_end_hx, transition_hx, constituent_hx), axis=1)
+            key = torch.cat((word_begin_hx, word_end_hx, transition_hx, constituent_hx), axis=1)
         else:
-            previous_layer = torch.cat((transition_hx, constituent_hx), axis=1)
+            key = torch.cat((transition_hx, constituent_hx), axis=1)
+        key = self.key(key)
+
+        node_hx = [torch.stack([con.tree_hx for con in constituents], axis=0) for constituents in constituent_lists]
+        queries = [self.query(nhx).reshape(nhx.shape[0], -1) for nhx in node_hx]
+        values = [self.value(nhx).reshape(nhx.shape[0], -1) for nhx in node_hx]
+        # TODO: could pad to make faster here
+        attn = [torch.matmul(q, k) for q, k in zip(queries, key)]
+        attn = [torch.softmax(x, dim=0).unsqueeze(0) for x in attn]
+        previous_layer = [torch.matmul(weight, value) for weight, value in zip(attn, values)]
+        previous_layer = torch.cat(previous_layer, dim=0)
+
         previous_layer = self.input_norm(previous_layer)
         previous_layer = self.dropout(previous_layer)
         for fc in self.fc_layers[:-1]:
