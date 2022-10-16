@@ -50,6 +50,8 @@ class ConstituencyClassifier(nn.Module):
             self.value = nn.Linear(self.constituency_parser.hidden_size, self.constituency_parser.hidden_size)
 
             self.fc_input_size = self.constituency_parser.hidden_size
+            if self.config.constituency_use_words:
+                self.fc_input_size += self.constituency_parser.hidden_size * self.constituency_parser.num_tree_lstm_layers * 2
         else:
             self.fc_input_size = self.hidden_size
         self.fc_layers = build_output_layers(self.fc_input_size, self.config.fc_shapes, self.config.num_classes)
@@ -113,6 +115,8 @@ class ConstituencyClassifier(nn.Module):
             attn = [torch.softmax(x, dim=0).unsqueeze(0) for x in attn]
             previous_layer = [torch.matmul(weight, value) for weight, value in zip(attn, values)]
             previous_layer = torch.cat(previous_layer, dim=0)
+            if self.config.constituency_use_words:
+                previous_layer = torch.cat((previous_layer, word_begin_hx, word_end_hx), dim=1)
         else:
             previous_layer = key
 
