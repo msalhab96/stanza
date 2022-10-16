@@ -23,6 +23,7 @@ class ConstituencyClassifier(nn.Module):
                                       num_classes = len(labels),
                                       constituency_backprop = args.constituency_backprop,
                                       constituency_batch_norm = args.constituency_batch_norm,
+                                      constituency_node_attn = args.constituency_node_attn,
                                       constituency_top_layer = args.constituency_top_layer,
                                       constituency_use_words = args.constituency_use_words,
                                       bert_model = args.bert_model,
@@ -43,12 +44,14 @@ class ConstituencyClassifier(nn.Module):
         else:
             self.input_norm = nn.Identity()
 
-        self.query = nn.Linear(self.constituency_parser.hidden_size, self.constituency_parser.hidden_size)
-        self.key = nn.Linear(self.hidden_size, self.constituency_parser.hidden_size)
-        self.value = nn.Linear(self.constituency_parser.hidden_size, self.constituency_parser.hidden_size)
+        if self.config.constituency_node_attn:
+            self.query = nn.Linear(self.constituency_parser.hidden_size, self.constituency_parser.hidden_size)
+            self.key = nn.Linear(self.hidden_size, self.constituency_parser.hidden_size)
+            self.value = nn.Linear(self.constituency_parser.hidden_size, self.constituency_parser.hidden_size)
 
-        self.fc_input_size = self.constituency_parser.hidden_size
-        #self.fc_input_size = self.hidden_size
+            self.fc_input_size = self.constituency_parser.hidden_size
+        else:
+            self.fc_input_size = self.hidden_size
         self.fc_layers = build_output_layers(self.fc_input_size, self.config.fc_shapes, self.config.num_classes)
         self.dropout = nn.Dropout(self.config.dropout)
 
@@ -99,16 +102,19 @@ class ConstituencyClassifier(nn.Module):
             key = torch.cat((word_begin_hx, word_end_hx, transition_hx, constituent_hx), axis=1)
         else:
             key = torch.cat((transition_hx, constituent_hx), axis=1)
-        key = self.key(key)
+        if self.config.constituency_node_attn:
+            key = self.key(key)
 
-        node_hx = [torch.stack([con.tree_hx for con in constituents], axis=0) for constituents in constituent_lists]
-        queries = [self.query(nhx).reshape(nhx.shape[0], -1) for nhx in node_hx]
-        values = [self.value(nhx).reshape(nhx.shape[0], -1) for nhx in node_hx]
-        # TODO: could pad to make faster here
-        attn = [torch.matmul(q, k) for q, k in zip(queries, key)]
-        attn = [torch.softmax(x, dim=0).unsqueeze(0) for x in attn]
-        previous_layer = [torch.matmul(weight, value) for weight, value in zip(attn, values)]
-        previous_layer = torch.cat(previous_layer, dim=0)
+            node_hx = [torch.stack([con.tree_hx for con in constituents], axis=0) for constituents in constituent_lists]
+            queries = [self.query(nhx).reshape(nhx.shape[0], -1) for nhx in node_hx]
+            values = [self.value(nhx).reshape(nhx.shape[0], -1) for nhx in node_hx]
+            # TODO: could pad to make faster here
+            attn = [torch.matmul(q, k) for q, k in zip(queries, key)]
+            attn = [torch.softmax(x, dim=0).unsqueeze(0) for x in attn]
+            previous_layer = [torch.matmul(weight, value) for weight, value in zip(attn, values)]
+            previous_layer = torch.cat(previous_layer, dim=0)
+        else:
+            previous_layer = key
 
         previous_layer = self.input_norm(previous_layer)
         previous_layer = self.dropout(previous_layer)
